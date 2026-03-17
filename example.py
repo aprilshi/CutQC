@@ -27,6 +27,7 @@ if __name__ == "__main__":
             "subcircuit_size_imbalance": 2,
             "max_cuts": 10,
             "num_subcircuits": [2, 3],
+            "clifford_weight": 5.0 # testing the clifford stuff!!
         },
         verbose=True,
     )

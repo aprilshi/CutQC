@@ -19,6 +19,8 @@ class MIP_Model(object):
         subcircuit_size_imbalance,
         num_qubits,
         max_cuts,
+        non_clifford_weights=None,
+        clifford_weight=0.0
     ):
         self.check_graph(n_vertices, edges)
         self.n_vertices = n_vertices
@@ -32,6 +34,11 @@ class MIP_Model(object):
         self.subcircuit_size_imbalance = math.sqrt(subcircuit_size_imbalance)
         self.num_qubits = num_qubits
         self.max_cuts = max_cuts
+        # CHANGE! Clifford weighting
+        self.non_clifford_weights = non_clifford_weights or {v: 0.0 for v in range(n_vertices)}
+        self.clifford_weight = clifford_weight
+        total = sum(self.non_clifford_weights.values())
+        self.nc_normaliser = total if total > 0 else 1.0
 
         """
         Count the number of input qubits directly connected to each node
@@ -248,7 +255,27 @@ class MIP_Model(object):
                     + self.subcircuit_counter[subcircuit]["O"]
                 )
 
-        self.model.setObjective(self.num_cuts, gp.GRB.MINIMIZE)
+        if self.clifford_weight > 0.0:
+            nc_per_sub = [
+                gp.quicksum(
+                    self.non_clifford_weights[v] * self.vertex_var[i][v]
+                    for v in range(self.n_vertices)
+                )
+                for i in range(self.num_subcircuit)
+            ]
+            self.nc_max = self.model.addVar(lb=0.0, ub=self.nc_normaliser, vtype=gp.GRB.CONTINUOUS, name="nc_max")
+            self.nc_min = self.model.addVar(lb=0.0, ub=self.nc_normaliser, vtype=gp.GRB.CONTINUOUS, name="nc_min")
+            for i in range(self.num_subcircuit):
+                self.model.addConstr(self.nc_max >= nc_per_sub[i])
+                self.model.addConstr(self.nc_min <= nc_per_sub[i])
+            self.model.update()
+            nc_imbalance = (self.nc_max - self.nc_min) / self.nc_normaliser
+            self.model.setObjective(
+                self.num_cuts - self.clifford_weight * nc_imbalance,
+                gp.GRB.MINIMIZE,
+            )
+        else:
+            self.model.setObjective(self.num_cuts, gp.GRB.MINIMIZE)
         self.model.update()
 
     def check_graph(self, n_vertices, edges):
@@ -268,7 +295,13 @@ class MIP_Model(object):
         try:
             self.model.params.threads = 48
             self.model.Params.TimeLimit = 30
+            self.model.Params.PoolSearchMode = 2  # exhaustive search for solutions
+            # self.model.Params.PoolSolutions = 10  # store up to 10 solutions
             self.model.optimize()
+            # print(f"Number of solutions found: {self.model.SolCount}")
+            # for i in range(self.model.SolCount):
+            #     self.model.Params.SolutionNumber = i
+            #     print(f"Solution {i}: obj={self.model.PoolObjVal:.4f}")
         except (gp.GurobiError, AttributeError, Exception) as e:
             logging.info("Caught: " + e.message)
 
@@ -306,6 +339,31 @@ class MIP_Model(object):
             # logging.info('Infeasible')
             return False
 
+NON_CLIFFORD_GATES = {"t", "rx", "ry", "u3"}
+def compute_non_clifford_weights(circuit, id_vertices):
+    dag = circuit_to_dag(circuit)
+    pending = {qubit: 0 for qubit in dag.qubits}
+    name_to_id = {v: k for k, v in id_vertices.items()}
+    weights = {vid: 0.0 for vid in id_vertices}
+    two_q_counter = {qubit: 0 for qubit in dag.qubits}  # mirrors read_circ exactly
+    for node in dag.topological_op_nodes():
+        if len(node.qargs) == 1:
+            if node.op.name in NON_CLIFFORD_GATES:
+                pending[node.qargs[0]] += 1
+            # do NOT increment any counter here
+        elif len(node.qargs) == 2:
+            a, b = node.qargs
+            name = "%s[%d]%d %s[%d]%d" % (
+                a._register.name, a._index, two_q_counter[a],
+                b._register.name, b._index, two_q_counter[b],
+            )
+            two_q_counter[a] += 1
+            two_q_counter[b] += 1
+            if name in name_to_id:
+                weights[name_to_id[name]] = float(pending[a] + pending[b])
+            pending[a] = 0
+            pending[b] = 0
+    return weights
 
 def read_circ(circuit):
     dag = circuit_to_dag(circuit)
@@ -605,9 +663,16 @@ def find_cuts(
     max_subcircuit_cuts,
     subcircuit_size_imbalance,
     verbose,
+    clifford_weight=0.0
 ):
     stripped_circ = circuit_stripping(circuit=circuit)
     n_vertices, edges, vertex_ids, id_vertices = read_circ(circuit=stripped_circ)
+    # CHANGE: Calculate non clifford weights
+    non_clifford_weights = compute_non_clifford_weights(circuit, id_vertices) 
+    # print(f"non clifford weights: {non_clifford_weights}")
+    if verbose and clifford_weight > 0.0:
+        total_nc = sum(non_clifford_weights.values())
+        logging.info(f"Clifford-awareness enabled (clifford_weight={clifford_weight}, total non-Clifford vertex weight={total_nc:.1f})")
     num_qubits = circuit.num_qubits
     cut_solution = {}
 
@@ -631,10 +696,14 @@ def find_cuts(
             subcircuit_size_imbalance=subcircuit_size_imbalance,
             num_qubits=num_qubits,
             max_cuts=max_cuts,
+            non_clifford_weights=non_clifford_weights,
+            clifford_weight=clifford_weight,
         )
 
         mip_model = MIP_Model(**kwargs)
         feasible = mip_model.solve()
+        logging.info(f"MIP node count: {mip_model.node_count}")
+        print(f"MIP node count: {mip_model.node_count}")
         if feasible:
             positions = cuts_parser(mip_model.cut_edges, circuit)
             subcircuits, complete_path_map = subcircuits_parser(
@@ -653,6 +722,11 @@ def find_cuts(
         elif verbose:
             logging.info("%d subcircuits : NO SOLUTIONS" % (num_subcircuit))
     if verbose and len(cut_solution) > 0:
+        if clifford_weight > 0.0:
+            for i, sc in enumerate(cut_solution["subcircuits"]):
+                nc = sum(1 for instr in sc.data if instr.operation.name in NON_CLIFFORD_GATES)
+                logging.info(f"Subcircuit_{i}: {nc} non-Clifford gates")
+        
         logging.info("-" * 20)
         log_cutter_result(
             num_cuts=cut_solution["num_cuts"],
@@ -662,6 +736,8 @@ def find_cuts(
 
         logging.info("Model objective value = %.2e" % (mip_model.objective))
         logging.info(f"MIP runtime: {mip_model.runtime}")
+        if clifford_weight > 0.0:
+            logging.info(f"NC imbalance achieved = {mip_model.nc_max.x - mip_model.nc_min.x:.2f} (out of normaliser {mip_model.nc_normaliser:.1f})")
 
         if mip_model.optimal:
             logging.info(f"OPTIMAL, MIP gap = {mip_model.mip_gap}")

@@ -59,9 +59,13 @@ class CutQC:
                 f"width = {self.circuit.num_qubits} depth = {self.circuit.depth()} size = {self.circuit.num_nonlocal_gates()} -->"
             )
             logging.info(self.cutter_constraints)
+            logging.info("Input circuit:")
+            logging.info("\n" + str(self.circuit))
         cutter_begin = perf_counter()
+        clifford_weight = self.cutter_constraints.get("clifford_weight", 0.0)
+        cutter_kwargs = {k: v for k, v in self.cutter_constraints.items() if k != "clifford_weight"}
         self.cut_solution = find_cuts(
-            **self.cutter_constraints, circuit=self.circuit, verbose=self.verbose
+            **cutter_kwargs, clifford_weight=clifford_weight, circuit=self.circuit, verbose=self.verbose
         )
         if "complete_path_map" in self.cut_solution:
             self.compute_graph, self.subcircuit_entries, self.subcircuit_instances = (
